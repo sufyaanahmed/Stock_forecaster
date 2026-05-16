@@ -39,7 +39,9 @@ def main():
 
     # 2. Build model
     n_features = data["X_train"].shape[2]
-    print(f"\nFeatures ({n_features}): {data['feature_cols']}")
+    feature_cols = data.get("feature_cols", [f"feat_{i}" for i in range(n_features)])
+    print(f"\nFeatures ({n_features}): {feature_cols}")
+
 
     model_cfg = ModelConfig(
         input_size=n_features,

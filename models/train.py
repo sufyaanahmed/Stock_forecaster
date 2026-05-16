@@ -161,7 +161,7 @@ def train(
     history = {"train_loss": [], "val_ic": [], "val_dir_acc": [], "lr": []}
 
     print(f"\n{'Epoch':>6} {'Train Loss':>12} {'Val IC':>10} {'Val DirAcc':>12} {'LR':>10}")
-    print("─" * 56)
+    print("-" * 56)
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
@@ -200,13 +200,13 @@ def train(
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     save_path = f"{save_dir}/{ticker}_lstm.pt"
     torch.save({
-        "model_state": stopper.best_state or model.state_dict(),
+        "model_state":  stopper.best_state or model.state_dict(),
         "model_config": model.cfg,
-        "history": history,
+        "history":      history,
         "test_metrics": test_metrics,
-        "feature_cols": data["feature_cols"],
+        "feature_cols": data.get("feature_cols", []),
     }, save_path)
-    print(f"\nModel saved → {save_path}")
+    print(f"\nModel saved -> {save_path}")
 
     return {
         "history": history,

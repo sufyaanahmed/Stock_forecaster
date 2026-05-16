@@ -189,10 +189,10 @@ def full_evaluation(
     }
 
     if verbose:
-        print(f"\n{'─'*45}")
+        print(f"\n{'-'*45}")
         print(f" EVALUATION SUMMARY: {ticker}")
-        print(f"{'─'*45}")
-        print(f"  IC (Spearman):       {ic:.4f}  (p={ic_sig['p_value']:.3f}, {'✓ significant' if ic_sig['significant'] else '✗ not significant'})")
+        print(f"{'-'*45}")
+        print(f"  IC (Spearman):       {ic:.4f}  (p={ic_sig['p_value']:.3f}, {'[sig]' if ic_sig['significant'] else '[not sig]'})")
         print(f"  Direction Accuracy:  {dir_acc:.4f}  (baseline: 0.50)")
         print(f"  Sharpe Ratio:        {bt['sharpe']:.3f}")
         print(f"  Sortino Ratio:       {bt['sortino']:.3f}")
@@ -202,6 +202,6 @@ def full_evaluation(
         print(f"  Alpha:               {bt['alpha']:.2%}")
         print(f"  Win Rate:            {bt['win_rate']:.2%}")
         print(f"  Num Trades:          {bt['n_trades']}")
-        print(f"{'─'*45}")
+        print(f"{'-'*45}")
 
     return result
