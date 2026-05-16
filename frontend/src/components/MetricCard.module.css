@@ -1,0 +1,111 @@
+.card {
+  position: relative;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  overflow: hidden;
+  transition: border-color 0.2s, transform 0.2s;
+  cursor: default;
+}
+
+.card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: linear-gradient(135deg, var(--card-color), transparent) border-box;
+  -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: destination-out;
+  mask-composite: exclude;
+  opacity: 0.4;
+  transition: opacity 0.2s;
+}
+
+.card:hover {
+  border-color: var(--border-hover);
+  transform: translateY(-2px);
+}
+.card:hover::before { opacity: 0.8; }
+
+.glow {
+  position: absolute;
+  top: -30px;
+  right: -30px;
+  width: 100px;
+  height: 100px;
+  background: radial-gradient(circle, var(--card-color) 0%, transparent 70%);
+  opacity: 0.07;
+  border-radius: 50%;
+}
+
+.scanLine {
+  position: absolute;
+  left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--card-color), transparent);
+  opacity: 0;
+  top: 0;
+  transition: opacity 0.2s;
+}
+.card:hover .scanLine {
+  opacity: 0.4;
+  animation: scan-line 1.5s linear infinite;
+}
+
+.icon {
+  color: var(--card-color);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+}
+
+.label {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.value {
+  font-size: 1.75rem;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--card-color);
+  line-height: 1;
+  margin-bottom: 4px;
+}
+
+.md .value { font-size: 1.75rem; }
+.sm .value { font-size: 1.2rem; }
+.lg .value { font-size: 2.4rem; }
+
+.sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.delta {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  margin-top: 4px;
+  font-weight: 600;
+}
+.pos { color: var(--green); }
+.neg { color: var(--red); }
+
+.corner {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 12px;
+  height: 12px;
+  border-bottom: 2px solid var(--card-color);
+  border-right: 2px solid var(--card-color);
+  border-radius: 0 0 6px 0;
+  opacity: 0.5;
+}

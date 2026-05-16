@@ -1,0 +1,111 @@
+/* ================================================================
+   QuantML Forecaster — Global Design System
+   Theme: Dark quant terminal + ML lab aesthetic
+   ================================================================ */
+
+:root {
+  /* Core palette */
+  --bg-void:     #020408;
+  --bg-deep:     #060d16;
+  --bg-panel:    #0a1628;
+  --bg-card:     #0e1e35;
+  --bg-surface:  #132540;
+  --bg-hover:    #1a3050;
+
+  /* Accent — electric cyan/teal (quant terminal vibes) */
+  --accent:        #00d4ff;
+  --accent-dim:    #0099cc;
+  --accent-glow:   rgba(0, 212, 255, 0.15);
+  --accent-glow2:  rgba(0, 212, 255, 0.06);
+
+  /* Signal colors */
+  --green:      #00ff88;
+  --green-dim:  #00cc6a;
+  --green-glow: rgba(0, 255, 136, 0.12);
+  --red:        #ff3366;
+  --red-dim:    #cc2952;
+  --red-glow:   rgba(255, 51, 102, 0.12);
+  --amber:      #ffaa00;
+  --amber-glow: rgba(255, 170, 0, 0.12);
+  --purple:     #a855f7;
+  --purple-dim: #8b46d4;
+
+  /* Text */
+  --text-primary:   #e8f4ff;
+  --text-secondary: #7ea8cc;
+  --text-muted:     #3d6080;
+  --text-dim:       #1e3a52;
+
+  /* Border */
+  --border:       rgba(0, 212, 255, 0.12);
+  --border-hover: rgba(0, 212, 255, 0.28);
+  --border-glow:  rgba(0, 212, 255, 0.5);
+
+  /* Mono font for data */
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --font-sans: 'Inter', system-ui, sans-serif;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg-void);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}
+
+body {
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(0,100,180,0.18) 0%, transparent 70%),
+    radial-gradient(ellipse 50% 30% at 80% 90%, rgba(0,212,255,0.06) 0%, transparent 60%);
+  min-height: 100vh;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-deep); }
+::-webkit-scrollbar-thumb { background: var(--bg-surface); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+
+/* Recharts override for dark theme */
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke: rgba(0, 212, 255, 0.06) !important;
+}
+.recharts-text { fill: var(--text-secondary) !important; font-size: 11px; font-family: var(--font-mono); }
+.recharts-tooltip-wrapper { outline: none; }
+
+/* Animations */
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes scan-line {
+  0%   { top: -2px; }
+  100% { top: 100%; }
+}
+@keyframes ticker-scroll {
+  0%   { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.animate-slide-up { animation: slide-up 0.4s ease both; }
+.animate-fade-in  { animation: fade-in 0.3s ease both; }

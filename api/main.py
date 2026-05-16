@@ -29,7 +29,7 @@ app = FastAPI(title="Stock Forecaster API", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["*"],   # dev: open to all origins (Vite picks dynamic ports)
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -171,21 +171,38 @@ def get_chart_data(ticker: str, period: str = "1y"):
     OHLCV + technical indicators for the frontend chart.
     period: '3m' | '6m' | '1y' | '2y' | '5y'
     """
-    period_map = {"3m": "90d", "6m": "180d", "1y": "365d", "2y": "730d", "5y": "1825d"}
-    days = int(period_map.get(period, "365d").replace("d", ""))
-    
+    import yfinance as yf
     import datetime
-    start = (datetime.datetime.today() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
-    
+
+    period_map = {"3m": 90, "6m": 180, "1y": 365, "2y": 730, "5y": 1825}
+    days = period_map.get(period, 365)
+
+    # Add extra lookback so rolling windows can warm up (60d)
+    fetch_days = days + 90
+    start = (datetime.datetime.today() - datetime.timedelta(days=fetch_days)).strftime("%Y-%m-%d")
+    end   = (datetime.datetime.today() - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+
     try:
-        cfg = DataConfig(ticker=ticker.upper(), start=start)
-        raw = fetch_raw(cfg)
+        raw = yf.download(
+            ticker.upper(), start=start, end=end,
+            auto_adjust=True, progress=False, threads=False
+        )
+        if raw is None or raw.empty or len(raw) < 50:
+            raise ValueError(f"Insufficient data for {ticker}: {0 if raw is None else len(raw)} rows")
+
+        raw.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in raw.columns]
+        raw = raw.dropna()
+        raw.index = pd.to_datetime(raw.index)
+
         feat = compute_features(raw)
+
+        # Trim to requested period only (after warmup)
+        cutoff = datetime.datetime.today() - datetime.timedelta(days=days)
+        feat = feat[feat.index >= cutoff]
+        raw  = raw.loc[feat.index]
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-    # Align raw and features (feat drops first N rows due to rolling windows)
-    raw_aligned = raw.loc[feat.index]
 
     def safe_list(series):
         return [round(float(v), 4) if not np.isnan(v) else None for v in series]
@@ -194,11 +211,11 @@ def get_chart_data(ticker: str, period: str = "1y"):
         "ticker": ticker.upper(),
         "dates":  [str(d.date()) for d in feat.index],
         "ohlcv": {
-            "open":   safe_list(raw_aligned['open']),
-            "high":   safe_list(raw_aligned['high']),
-            "low":    safe_list(raw_aligned['low']),
-            "close":  safe_list(raw_aligned['close']),
-            "volume": safe_list(raw_aligned['volume']),
+            "open":   safe_list(raw['open']),
+            "high":   safe_list(raw['high']),
+            "low":    safe_list(raw['low']),
+            "close":  safe_list(raw['close']),
+            "volume": safe_list(raw['volume']),
         },
         "indicators": {
             "rsi_14":      safe_list(feat['rsi_14']),
@@ -208,6 +225,7 @@ def get_chart_data(ticker: str, period: str = "1y"):
         },
         "log_returns": safe_list(feat['log_return']),
     }
+
 
 
 @app.get("/api/analyze/{ticker}", response_model=AnalysisResponse)
@@ -273,7 +291,7 @@ def analyze_ticker(ticker: str):
         confidence_score=round(confidence, 3),
         ic=eval_result["ic"],
         ic_significant=eval_result["ic_significant"],
-        direction_accuracy=eval_result["direction_accuracy"],
+        direction_accuracy=eval_result["direction_acc"],
         sharpe=bt["sharpe"],
         max_drawdown=bt["max_drawdown"],
         total_return=bt["total_return"],
