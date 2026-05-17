@@ -1,35 +1,57 @@
 """
-FastAPI Backend
-===============
-Serves:
-  - /api/analyze/{ticker}    : full analysis (features, prediction, backtest stats)
-  - /api/predict/{ticker}    : latest signal only (fast)
-  - /api/chart/{ticker}      : OHLCV + indicators for frontend chart
-  - /api/train/{ticker}      : trigger model training (async)
-  - /api/models              : list trained models
+FastAPI Backend — QuantML Stock Forecaster
+==========================================
+Endpoints:
+  GET  /api/health              → liveness probe
+  GET  /api/models              → list trained checkpoints
+  GET  /api/chart/{ticker}      → OHLCV + indicators (chart data)
+  GET  /api/analyze/{ticker}    → full analysis + prediction
+  POST /api/train               → trigger background training
+  GET  /api/train/status/{tick} → poll training progress
+
+Design:
+  - Server-side data cache (TTL-based) avoids hammering yfinance on every request
+  - Model cache keeps loaded PyTorch models in memory (no disk re-load per request)
+  - Background tasks run training without blocking the event loop
+  - CORS is permissive in dev; the Vite proxy means the browser never sees it
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from __future__ import annotations
+
+import os
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import numpy as np
+import pandas as pd
+import torch
+import yfinance as yf
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import numpy as np
-import torch
-import os, json
-from pathlib import Path
-from typing import Optional, Dict, Any
-import sys
-sys.path.append(str(Path(__file__).parent.parent))
 
-from data.pipeline import DataConfig, load_and_prepare, fetch_raw, compute_features
+# ── Path so imports find local packages regardless of cwd ────────────────────
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from data.pipeline import (
+    DataConfig,
+    compute_features,
+    load_and_prepare,
+    safe_end_date,
+)
+from evaluation.metrics import backtest, full_evaluation
 from models.lstm import LSTMForecaster, ModelConfig
-from models.train import train, information_coefficient, direction_accuracy
-from evaluation.metrics import full_evaluation, backtest, compute_sharpe
+from models.train import train
 
-app = FastAPI(title="Stock Forecaster API", version="1.0")
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="QuantML Stock Forecaster API", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # dev: open to all origins (Vite picks dynamic ports)
+    allow_origins=["*"],   # Dev: Vite proxy handles CORS; production should restrict this
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -37,11 +59,21 @@ app.add_middleware(
 CHECKPOINT_DIR = "checkpoints"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# In-memory cache for loaded models (avoid re-loading on every request)
+# ── Server-side caches ────────────────────────────────────────────────────────
+
+# Model cache: ticker → {model, feature_cols, test_metrics, history}
 _model_cache: Dict[str, Any] = {}
 
+# Data cache: ticker → {data_dict, fetched_at}
+# Avoids re-downloading/re-preprocessing on back-to-back requests
+_data_cache: Dict[str, Dict] = {}
+DATA_CACHE_TTL = 300  # seconds (5 min)
 
-# ── Schema ────────────────────────────────────────────────────────────────────
+# Chart-specific raw data cache: key → {payload, fetched_at}
+_chart_cache: Dict[str, Dict] = {}
+CHART_CACHE_TTL = 120  # seconds (2 min)
+
+# ── Schemas ───────────────────────────────────────────────────────────────────
 
 class TrainRequest(BaseModel):
     ticker: str
@@ -53,9 +85,9 @@ class TrainRequest(BaseModel):
 class AnalysisResponse(BaseModel):
     ticker: str
     latest_close: float
-    predicted_direction: str       # "UP" | "DOWN" | "NEUTRAL"
+    predicted_direction: str        # "UP" | "DOWN" | "NEUTRAL"
     predicted_return_pct: float
-    confidence_score: float        # |predicted_return| scaled 0-1 relative to history
+    confidence_score: float
     ic: float
     ic_significant: bool
     direction_accuracy: float
@@ -64,47 +96,76 @@ class AnalysisResponse(BaseModel):
     total_return: float
     buy_hold_return: float
     model_trained: bool
+    data_source: str = "yfinance"
+    cache_hit: bool = False
 
 
-# ── Model loading ─────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def load_model(ticker: str):
-    """Load model from checkpoint, with in-memory caching."""
+def _get_prepared_data(ticker: str, start: str = "2015-01-01", seq_len: int = 60) -> dict:
+    """
+    Load and prepare data with server-side TTL cache.
+    Avoids re-downloading yfinance data on every request.
+    """
+    cache_key = f"{ticker}:{start}:{seq_len}"
+    entry = _data_cache.get(cache_key)
+    if entry and (time.time() - entry["fetched_at"]) < DATA_CACHE_TTL:
+        return entry["data"]
+
+    cfg  = DataConfig(ticker=ticker, start=start, seq_len=seq_len)
+    data = load_and_prepare(cfg)
+    _data_cache[cache_key] = {"data": data, "fetched_at": time.time()}
+    return data
+
+
+def _load_model(ticker: str) -> Optional[dict]:
+    """Load PyTorch model from checkpoint with in-memory caching."""
     if ticker in _model_cache:
         return _model_cache[ticker]
 
-    path = f"{CHECKPOINT_DIR}/{ticker}_lstm.pt"
-    if not os.path.exists(path):
+    path = Path(CHECKPOINT_DIR) / f"{ticker}_lstm.pt"
+    if not path.exists():
         return None
 
-    checkpoint = torch.load(path, map_location=device)
-    cfg = checkpoint["model_config"]
-    model = LSTMForecaster(cfg).to(device)
-    model.load_state_dict(checkpoint["model_state"])
-    model.eval()
+    try:
+        checkpoint = torch.load(str(path), map_location=device, weights_only=False)
+        cfg   = checkpoint["model_config"]
+        model = LSTMForecaster(cfg).to(device)
+        model.load_state_dict(checkpoint["model_state"])
+        model.eval()
 
-    _model_cache[ticker] = {
-        "model": model,
-        "feature_cols": checkpoint["feature_cols"],
-        "test_metrics": checkpoint["test_metrics"],
-        "history": checkpoint["history"],
-    }
-    return _model_cache[ticker]
+        _model_cache[ticker] = {
+            "model":        model,
+            "feature_cols": checkpoint.get("feature_cols", []),
+            "test_metrics": checkpoint["test_metrics"],
+            "history":      checkpoint.get("history", {}),
+        }
+        return _model_cache[ticker]
+    except Exception as exc:
+        print(f"[load_model] ERROR loading {ticker}: {exc}")
+        return None
 
 
-# ── Background training ───────────────────────────────────────────────────────
+def _safe_series_list(series: pd.Series) -> list:
+    """Convert pandas Series to JSON-safe list (NaN → None)."""
+    return [
+        None if (v is None or (isinstance(v, float) and np.isnan(v))) else round(float(v), 6)
+        for v in series
+    ]
 
+
+# ── Training state ────────────────────────────────────────────────────────────
 training_status: Dict[str, str] = {}
 
 
-def run_training(req: TrainRequest):
-    """Run in background — doesn't block the API."""
+def _run_training(req: TrainRequest) -> None:
+    """Background training job. Updates training_status in-place."""
     ticker = req.ticker.upper()
     training_status[ticker] = "running"
     try:
         cfg = DataConfig(ticker=ticker, start=req.start, seq_len=req.seq_len)
         data = load_and_prepare(cfg)
-        
+
         model_cfg = ModelConfig(
             input_size=data["X_train"].shape[2],
             hidden_size=128,
@@ -112,141 +173,202 @@ def run_training(req: TrainRequest):
             dropout=0.3,
             use_attention=True,
         )
-        model = LSTMForecaster(model_cfg)
+        model  = LSTMForecaster(model_cfg)
         result = train(
             model, data,
             epochs=req.epochs,
             save_dir=CHECKPOINT_DIR,
             ticker=ticker,
         )
-        # Invalidate cache so fresh model loads next request
+
+        # Invalidate caches so next request picks up fresh model + data
         _model_cache.pop(ticker, None)
-        training_status[ticker] = f"done|IC:{result['test_metrics']['ic']:.4f}"
-    except Exception as e:
-        training_status[ticker] = f"error|{str(e)}"
+        _data_cache.pop(f"{ticker}:{req.start}:{req.seq_len}", None)
+
+        ic = result["test_metrics"]["ic"]
+        training_status[ticker] = f"done|IC:{ic:.4f}"
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[training] ERROR for {ticker}:\n{tb}")
+        training_status[ticker] = f"error|{exc}"
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "device": str(device)}
+    """Liveness probe. Returns immediately."""
+    return {"status": "ok", "device": str(device), "ts": int(time.time())}
+
+
+@app.get("/api/models")
+def list_models():
+    """Return all trained model checkpoints with their test metrics."""
+    Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
+    result = []
+    for f in sorted(Path(CHECKPOINT_DIR).glob("*_lstm.pt")):
+        ticker = f.stem.replace("_lstm", "").upper()
+        try:
+            ckpt = torch.load(str(f), map_location="cpu", weights_only=False)
+            result.append({
+                "ticker":       ticker,
+                "test_ic":      round(ckpt["test_metrics"]["ic"],      4),
+                "test_dir_acc": round(ckpt["test_metrics"]["dir_acc"], 4),
+            })
+        except Exception:
+            pass   # skip corrupt checkpoints silently
+    return result
 
 
 @app.post("/api/train")
 def trigger_training(req: TrainRequest, background_tasks: BackgroundTasks):
-    """Start training in background. Poll /api/train/status/{ticker} for progress."""
+    """
+    Start training in the background.
+    Poll /api/train/status/{ticker} for progress.
+    """
     ticker = req.ticker.upper()
     if training_status.get(ticker) == "running":
         return {"status": "already_running", "ticker": ticker}
-    background_tasks.add_task(run_training, req)
+    background_tasks.add_task(_run_training, req)
     return {"status": "started", "ticker": ticker}
 
 
 @app.get("/api/train/status/{ticker}")
 def train_status(ticker: str):
+    """Return current training status for a ticker."""
     status = training_status.get(ticker.upper(), "not_started")
     return {"ticker": ticker.upper(), "status": status}
-
-
-@app.get("/api/models")
-def list_models():
-    """List all trained models."""
-    Path(CHECKPOINT_DIR).mkdir(exist_ok=True)
-    models = []
-    for f in Path(CHECKPOINT_DIR).glob("*_lstm.pt"):
-        ticker = f.stem.replace("_lstm", "")
-        ckpt = torch.load(f, map_location="cpu")
-        models.append({
-            "ticker": ticker,
-            "test_ic": round(ckpt["test_metrics"]["ic"], 4),
-            "test_dir_acc": round(ckpt["test_metrics"]["dir_acc"], 4),
-        })
-    return models
 
 
 @app.get("/api/chart/{ticker}")
 def get_chart_data(ticker: str, period: str = "1y"):
     """
-    OHLCV + technical indicators for the frontend chart.
-    period: '3m' | '6m' | '1y' | '2y' | '5y'
+    OHLCV + technical indicators for the frontend charting panel.
+    Periods: 3m | 6m | 1y | 2y | 5y
+
+    Uses a server-side 2-minute cache to avoid hammering yfinance.
+    Fetches extra warm-up rows (90 days) so rolling indicators are valid.
     """
-    import yfinance as yf
+    cache_key = f"chart:{ticker}:{period}"
+    entry = _chart_cache.get(cache_key)
+    if entry and (time.time() - entry["fetched_at"]) < CHART_CACHE_TTL:
+        payload = dict(entry["payload"])
+        payload["cache_hit"] = True
+        return payload
+
+    period_days = {"3m": 90, "6m": 180, "1y": 365, "2y": 730, "5y": 1825}
+    days      = period_days.get(period, 365)
+    warmup    = 90  # extra days for rolling windows to warm up
+    total_days = days + warmup
+
     import datetime
-
-    period_map = {"3m": 90, "6m": 180, "1y": 365, "2y": 730, "5y": 1825}
-    days = period_map.get(period, 365)
-
-    # Add extra lookback so rolling windows can warm up (60d)
-    fetch_days = days + 90
-    start = (datetime.datetime.today() - datetime.timedelta(days=fetch_days)).strftime("%Y-%m-%d")
-    end   = (datetime.datetime.today() - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+    today  = datetime.datetime.utcnow()
+    start  = (today - datetime.timedelta(days=total_days)).strftime("%Y-%m-%d")
+    end    = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
     try:
         raw = yf.download(
-            ticker.upper(), start=start, end=end,
-            auto_adjust=True, progress=False, threads=False
+            ticker.upper(),
+            start=start,
+            end=end,
+            auto_adjust=True,
+            progress=False,
+            threads=False,
         )
-        if raw is None or raw.empty or len(raw) < 50:
-            raise ValueError(f"Insufficient data for {ticker}: {0 if raw is None else len(raw)} rows")
 
-        raw.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in raw.columns]
+        if raw is None or raw.empty or len(raw) < 30:
+            raise ValueError(
+                f"Not enough data returned for {ticker.upper()} "
+                f"({0 if raw is None else len(raw)} rows)"
+            )
+
+        # Flatten MultiIndex columns (yfinance ≥0.2.x)
+        raw.columns = [
+            c[0].lower() if isinstance(c, tuple) else c.lower()
+            for c in raw.columns
+        ]
         raw = raw.dropna()
         raw.index = pd.to_datetime(raw.index)
 
         feat = compute_features(raw)
 
-        # Trim to requested period only (after warmup)
-        cutoff = datetime.datetime.today() - datetime.timedelta(days=days)
-        feat = feat[feat.index >= cutoff]
-        raw  = raw.loc[feat.index]
+        # Trim to requested period (discard warm-up rows)
+        cutoff = today - datetime.timedelta(days=days)
+        feat   = feat[feat.index >= pd.Timestamp(cutoff)]
+        raw    = raw.loc[feat.index]
 
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    def safe_list(series):
-        return [round(float(v), 4) if not np.isnan(v) else None for v in series]
-
-    return {
-        "ticker": ticker.upper(),
-        "dates":  [str(d.date()) for d in feat.index],
+    payload = {
+        "ticker":   ticker.upper(),
+        "period":   period,
+        "dates":    [str(d.date()) for d in feat.index],
         "ohlcv": {
-            "open":   safe_list(raw['open']),
-            "high":   safe_list(raw['high']),
-            "low":    safe_list(raw['low']),
-            "close":  safe_list(raw['close']),
-            "volume": safe_list(raw['volume']),
+            "open":   _safe_series_list(raw["open"]),
+            "high":   _safe_series_list(raw["high"]),
+            "low":    _safe_series_list(raw["low"]),
+            "close":  _safe_series_list(raw["close"]),
+            "volume": _safe_series_list(raw["volume"]),
         },
         "indicators": {
-            "rsi_14":      safe_list(feat['rsi_14']),
-            "macd_norm":   safe_list(feat['macd_norm']),
-            "bb_position": safe_list(feat['bb_position']),
-            "vol_20":      safe_list(feat['vol_20']),
+            "rsi_14":      _safe_series_list(feat["rsi_14"]),
+            "macd_norm":   _safe_series_list(feat["macd_norm"]),
+            "bb_position": _safe_series_list(feat["bb_position"]),
+            "vol_20":      _safe_series_list(feat["vol_20"]),
         },
-        "log_returns": safe_list(feat['log_return']),
+        "log_returns": _safe_series_list(feat["log_return"]),
+        "cache_hit":   False,
     }
 
+    _chart_cache[cache_key] = {"payload": payload, "fetched_at": time.time()}
+    return payload
 
 
 @app.get("/api/analyze/{ticker}", response_model=AnalysisResponse)
 def analyze_ticker(ticker: str):
     """
-    Full analysis: load model → latest features → predict → backtest stats.
-    If no model trained yet, returns stats with model_trained=False.
+    Full analysis pipeline:
+      1. Load or fetch prepared data (cached 5 min)
+      2. Load model from checkpoint (cached in memory)
+      3. Run inference on test set
+      4. Compute backtest metrics
+      5. Return structured response
+
+    If no model checkpoint exists, returns model_trained=False with price only.
     """
     ticker = ticker.upper()
-    loaded = load_model(ticker)
+    cache_hit = False
 
+    # ── 1. Data ──────────────────────────────────────────────────────────────
     try:
-        cfg = DataConfig(ticker=ticker)
-        data = load_and_prepare(cfg)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Data error: {e}")
+        cache_key = f"{ticker}:2015-01-01:60"
+        entry = _data_cache.get(cache_key)
+        if entry and (time.time() - entry["fetched_at"]) < DATA_CACHE_TTL:
+            data      = entry["data"]
+            cache_hit = True
+        else:
+            data = _get_prepared_data(ticker)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Data pipeline error: {exc}")
 
-    raw = fetch_raw(cfg)
-    latest_close = float(raw['close'].iloc[-1])
+    # ── 2. Latest close price ─────────────────────────────────────────────────
+    try:
+        raw = data.get("raw")
+        if raw is not None and not raw.empty:
+            latest_close = float(raw["close"].iloc[-1])
+        else:
+            latest_close = 0.0
+    except Exception:
+        latest_close = 0.0
+
+    # ── 3. Load model ─────────────────────────────────────────────────────────
+    loaded = _load_model(ticker)
 
     if loaded is None:
+        # No checkpoint → return price + untrained placeholder
         return AnalysisResponse(
             ticker=ticker,
             latest_close=latest_close,
@@ -261,11 +383,11 @@ def analyze_ticker(ticker: str):
             total_return=0.0,
             buy_hold_return=0.0,
             model_trained=False,
+            cache_hit=cache_hit,
         )
 
-    model = loaded["model"]
-
-    # Get latest sequence for live prediction
+    # ── 4. Inference ─────────────────────────────────────────────────────────
+    model  = loaded["model"]
     X_test = torch.FloatTensor(data["X_test"]).to(device)
     y_test = data["y_test"]
 
@@ -273,14 +395,15 @@ def analyze_ticker(ticker: str):
         y_pred = model(X_test).cpu().numpy().flatten()
 
     latest_pred = float(y_pred[-1])
-    direction = "UP" if latest_pred > 0.0005 else ("DOWN" if latest_pred < -0.0005 else "NEUTRAL")
+    if   latest_pred >  0.0005: direction = "UP"
+    elif latest_pred < -0.0005: direction = "DOWN"
+    else:                       direction = "NEUTRAL"
 
-    # Confidence: where does |latest_pred| sit in distribution of |predictions|
-    abs_preds = np.abs(y_pred)
+    abs_preds  = np.abs(y_pred)
     confidence = float(np.mean(abs_preds <= abs(latest_pred)))
 
-    # Backtest on test set
-    bt = backtest(y_test, y_pred)
+    # ── 5. Metrics ────────────────────────────────────────────────────────────
+    bt          = backtest(y_test, y_pred)
     eval_result = full_evaluation(y_test, y_pred, ticker=ticker, verbose=False)
 
     return AnalysisResponse(
@@ -297,9 +420,17 @@ def analyze_ticker(ticker: str):
         total_return=bt["total_return"],
         buy_hold_return=bt["buy_hold_return"],
         model_trained=True,
+        cache_hit=cache_hit,
     )
 
 
+# ── Dev entry point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "api.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        reload_dirs=["api", "data", "models", "evaluation"],
+    )
