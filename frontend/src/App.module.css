@@ -2,6 +2,25 @@
    App Layout
    ================================================================ */
 
+/* ── Offline banner (shown when API is unreachable) ─────────── */
+.offlineBanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 24px;
+  background: rgba(255, 170, 0, 0.08);
+  border-bottom: 1px solid rgba(255, 170, 0, 0.3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--amber);
+}
+.offlineBanner code {
+  background: rgba(255,170,0,0.15);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
 .root {
   display: flex;
   flex-direction: column;
@@ -341,6 +360,10 @@
   transition: border-color 0.15s;
 }
 .featCard:hover { border-color: var(--border-hover); }
+.featHighlight {
+  border-color: rgba(0,255,136,0.25) !important;
+  background: linear-gradient(135deg, rgba(0,255,136,0.04), var(--bg-card)) !important;
+}
 .featName {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -367,7 +390,7 @@
 .error {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   padding: 16px 20px;
   background: rgba(255, 51, 102, 0.08);
   border: 1px solid rgba(255, 51, 102, 0.3);
@@ -379,14 +402,86 @@
 .errorIcon {
   font-weight: 900;
   font-size: 1.2rem;
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   border: 2px solid var(--red);
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+}
+.errorContent { flex: 1; }
+.errorMsg { margin-bottom: 4px; }
+.errorHint {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+.errorHint code {
+  background: rgba(255,51,102,0.15);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.retryBtn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255,51,102,0.15);
+  border: 1px solid rgba(255,51,102,0.3);
+  border-radius: 5px;
+  padding: 6px 12px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--red);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.retryBtn:hover { background: rgba(255,51,102,0.25); }
+
+/* Chart error */
+.chartErrorBox {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.retryBtnSmall {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 10px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--accent);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.retryBtnSmall:hover { border-color: var(--accent-dim); }
+
+/* Cache tag */
+.cacheTag {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(0,212,255,0.08);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
 }
 
 .trainView { animation: slide-up 0.3s ease; }
