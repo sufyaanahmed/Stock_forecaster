@@ -213,21 +213,13 @@ class FeatureEngineer:
         Features:
           - overnight_gap: (Open - Prev Close) / Prev Close
           - gap_direction: sign of overnight gap
-        
-        Note: skips gracefully if 'Open' column is absent.
         """
         df = df.copy()
-
-        if "Open" not in df.columns:
-            logger.debug("'Open' column not available — gap features set to 0")
-            df["overnight_gap"]  = 0.0
-            df["gap_direction"]  = 0.0
-            return df
-
+        
         df["prev_close"] = df.groupby("ticker")["Close"].shift(1)
         df["overnight_gap"] = (df["Open"] - df["prev_close"]) / (df["prev_close"] + 1e-8)
         df["gap_direction"] = np.sign(df["overnight_gap"])
-
+        
         return df
 
     def compute_momentum(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -409,14 +401,18 @@ class FeatureEngineer:
         
         return features
 
-    def drop_nan_rows(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Remove rows with NaN features (burn-in period)."""
+    def drop_nan_rows(self, df: pd.DataFrame, require_target: bool = True) -> pd.DataFrame:
+        """Remove rows with NaN features.
+
+        If `require_target` is False, inference datasets can be scored without label columns.
+        """
         feature_cols = self.get_feature_list(include_target=False)
         valid_cols = [c for c in feature_cols if c in df.columns]
-        
-        df = df.dropna(subset=valid_cols + ["target_rank"])
+
+        subset = valid_cols + (["target_rank"] if require_target and "target_rank" in df.columns else [])
+        df = df.dropna(subset=subset)
         logger.info(f"After dropping NaNs: {len(df)} rows")
-        
+
         return df
 
     def normalize_features(self, df: pd.DataFrame, fit_data: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict]:

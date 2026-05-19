@@ -15,7 +15,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
@@ -35,6 +35,14 @@ UNIVERSES = {
     "sp500_tech": ["NVDA", "META", "AAPL", "MSFT", "TSLA", "GOOGL", "AMZN", "NFLX"],
     "nasdaq_100": ["NVDA", "META", "AAPL", "MSFT", "TSLA", "GOOGL", "AMZN", "NFLX", "ADBE", "CRM"],
     "nifty_50": ["INFY", "TCS", "RELIANCE", "HINDUNILVR", "ICICIBANK", "HDFC", "BAJAJFINSV", "MARUTI"],
+    "equities": ["AAPL", "MSFT", "NVDA", "META", "GOOGL", "AMZN", "TSLA", "NFLX"],
+    "commodities": ["GLD", "SLV", "USO", "DBC", "XLE", "DBB", "PALL"],
+    "bonds": ["TLT", "IEF", "SHY", "AGG", "BND"],
+    "ai": ["NVDA", "AMD", "MSFT", "GOOGL", "META", "ADBE", "CRM"],
+    "growth": ["AMZN", "NFLX", "SHOP", "SQ", "ZM", "TSLA", "ROKU", "DOCU"],
+    "india": ["INFY", "TCS", "RELIANCE", "HINDUNILVR", "ICICIBANK", "HDFC", "MAHINDRA", "AXISBANK"],
+    "crypto": ["BTC-USD", "ETH-USD", "BNB-USD", "ADA-USD", "SOL-USD"],
+    "macro": ["TLT", "GLD", "USO", "VNQ", "XLF"],
     "custom": [],
 }
 
@@ -42,7 +50,8 @@ UNIVERSES = {
 @dataclass
 class DatasetConfig:
     """Configuration for market dataset loader."""
-    universe: str = "sp500_tech"
+    universe: Union[str, List[str]] = "sp500_tech"
+    tickers: Optional[List[str]] = None
     start_date: str = "2023-01-01"
     end_date: Optional[str] = None
     seq_len: int = 60  # lookback window for features
@@ -62,11 +71,20 @@ class MarketDataset:
         self.config = config
         self.cache_dir = Path(config.cache_dir or "/tmp/market_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.tickers = UNIVERSES.get(config.universe, config.universe)
-        if isinstance(self.tickers, str):
-            self.tickers = config.universe.split(",")
-        
+
+        if config.tickers:
+            self.tickers = [t.strip().upper() for t in config.tickers if t and isinstance(t, str)]
+        elif isinstance(config.universe, list):
+            self.tickers = [t.strip().upper() for t in config.universe if t and isinstance(t, str)]
+        elif isinstance(config.universe, str) and config.universe in UNIVERSES:
+            self.tickers = UNIVERSES[config.universe]
+        elif isinstance(config.universe, str) and "," in config.universe:
+            self.tickers = [t.strip().upper() for t in config.universe.split(",") if t.strip()]
+        elif isinstance(config.universe, str):
+            self.tickers = [config.universe.strip().upper()]
+        else:
+            self.tickers = []
+
         self._stock_cache: Dict[str, pd.DataFrame] = {}
         self._macro_cache: Optional[pd.DataFrame] = None
 
@@ -104,19 +122,10 @@ class MarketDataset:
                 start=self.config.start_date,
                 end=self.safe_end_date(),
                 progress=False,
-                auto_adjust=True,
             )
             if df.empty:
                 logger.warning(f"No data for {ticker}")
                 return pd.DataFrame()
-
-            # ── Flatten MultiIndex columns (yfinance ≥0.2 single-ticker) ─────
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [
-                    col[0] if isinstance(col, tuple) else col
-                    for col in df.columns
-                ]
-            df = df.loc[:, ~df.columns.duplicated()]
 
             # Save to cache
             df.to_pickle(cache_file)
@@ -155,25 +164,7 @@ class MarketDataset:
         dfs = []
         for ticker, df in stock_data.items():
             df_copy = df.copy()
-
-            # ── Flatten MultiIndex columns produced by yfinance ≥0.2 ──────────
-            # e.g. ('Close', 'AAPL') → 'Close'
-            if isinstance(df_copy.columns, pd.MultiIndex):
-                df_copy.columns = [
-                    col[0] if isinstance(col, tuple) else col
-                    for col in df_copy.columns
-                ]
-
-            # Remove duplicate columns that arise after MultiIndex flattening
-            df_copy = df_copy.loc[:, ~df_copy.columns.duplicated()]
-
-            # Ensure the index is reset so 'Date' becomes a plain column
             df_copy = df_copy.reset_index()
-
-            # Normalise the date column name (yfinance uses 'Date' or 'Datetime')
-            if "Datetime" in df_copy.columns and "Date" not in df_copy.columns:
-                df_copy = df_copy.rename(columns={"Datetime": "Date"})
-
             df_copy["ticker"] = ticker
             dfs.append(df_copy)
 
@@ -210,32 +201,22 @@ class MarketDataset:
             DataFrame with additional 'target_rank' column [0, 1]
         """
         df = df.copy()
+        df = df.sort_values(["date", "ticker"])
 
-        # ── FIX: remove duplicate columns before any assignment ───────────────
-        df = df.loc[:, ~df.columns.duplicated()]
+        # Compute forward returns by date
+        df["forward_return"] = df.groupby("ticker")["Close"].shift(-forward_days) / df["Close"] - 1
 
-        # Ensure 'Close' is a plain 1-D Series (yfinance ≥0.2 can produce
-        # a DataFrame with a MultiIndex when multiple tickers are downloaded)
-        if isinstance(df["Close"], pd.DataFrame):
-            df["Close"] = df["Close"].iloc[:, 0]
+        # For each date, compute percentile rank of forward returns
+        def compute_rank(group):
+            group["target_rank"] = group["forward_return"].rank(pct=True)
+            return group
 
-        df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+        df = df.groupby("date", group_keys=False).apply(compute_rank)
 
-        # ── Safe forward-return computation ───────────────────────────────────
-        # groupby().shift() returns a Series aligned to df's index — safe assign
-        future_close = df.groupby("ticker")["Close"].shift(-forward_days)
-        df["forward_return"] = (future_close / df["Close"]) - 1
-
-        # ── Cross-sectional percentile rank per date ──────────────────────────
-        df["target_rank"] = (
-            df.groupby("date")["forward_return"]
-            .rank(pct=True)
-        )
-
-        # Remove rows where target is NaN (last `forward_days` rows per ticker)
+        # Remove forward rows with NaN targets (last forward_days)
         df = df.dropna(subset=["target_rank"])
 
-        return df[["date", "ticker", "Close", "Volume", "target_rank"]]
+        return df
 
     def get_trading_universe(self, date: datetime) -> List[str]:
         """Return list of tickers with valid data on given date."""

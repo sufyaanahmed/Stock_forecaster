@@ -23,13 +23,13 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
 import torch
 import yfinance as yf
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -45,18 +45,16 @@ from data.pipeline import (
 from evaluation.metrics import backtest, full_evaluation
 from models.lstm import LSTMForecaster, ModelConfig
 from models.train import train
-from services.log_service import install_handler, get_logs, push_log
+from services.log_service import get_logs, install_handler
 
 # ── Import new routes (Market Mode + Legacy Mode) ────────────────────────────
 from routes.analyze import router as market_router
 from routes.legacy_routes import router as legacy_router
 
-# ── Install centralized log handler on all relevant loggers ──────────────────
-for _logger_name in ["", "services", "routes", "data", "models", "evaluation"]:
-    install_handler(_logger_name)
-
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="QuantML Stock Forecaster API", version="2.0")
+app = FastAPI(title="QuantML Stock Forecaster API", version="1.1")
+
+install_handler()
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,18 +63,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Register NEW market mode routes ──────────────────────────────────────────
+# ── Register NEW market mode routes (DEFAULT) ────────────────────────────────
 app.include_router(market_router)
 
 # ── Register LEGACY routes (backward compatible) ──────────────────────────────
 app.include_router(legacy_router)
 
+@app.get("/api/logs")
+def api_logs(since: int = 0, limit: int = 200):
+    return {"logs": get_logs(since, limit)}
+
 CHECKPOINT_DIR = "checkpoints"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ── Global mode state ─────────────────────────────────────────────────────────
-# Only ONE pipeline is active at a time.
-_active_mode: str = "legacy"   # "legacy" | "market"
 
 # ── Server-side caches ────────────────────────────────────────────────────────
 
@@ -252,41 +250,7 @@ def root():
 @app.get("/api/health")
 def health():
     """Liveness probe. Returns immediately."""
-    return {"status": "ok", "device": str(device), "ts": int(time.time()), "mode": _active_mode}
-
-
-# ── Mode switching ────────────────────────────────────────────────────────────
-
-class ModeRequest(BaseModel):
-    mode: str   # "legacy" | "market"
-
-
-@app.get("/api/mode")
-def get_mode():
-    """Return the currently active pipeline mode."""
-    return {"mode": _active_mode}
-
-
-@app.post("/api/mode")
-def set_mode(req: ModeRequest):
-    """Switch between 'legacy' (single-stock LSTM) and 'market' (ranker) modes."""
-    global _active_mode
-    if req.mode not in ("legacy", "market"):
-        raise HTTPException(status_code=400, detail="mode must be 'legacy' or 'market'")
-    _active_mode = req.mode
-    push_log("INFO", "api", f"Mode switched to '{_active_mode}'")
-    return {"mode": _active_mode, "status": "ok"}
-
-
-# ── Logs endpoint (polling-based SSE alternative) ─────────────────────────────
-
-@app.get("/api/logs")
-def get_log_records(
-    since: int = Query(0, description="Return only records after this epoch-ms timestamp"),
-    limit: int = Query(200, ge=1, le=500),
-):
-    """Return recent structured log records for frontend live-log panel."""
-    return {"logs": get_logs(since_ts=since, limit=limit)}
+    return {"status": "ok", "device": str(device), "ts": int(time.time())}
 
 
 @app.get("/api/models")

@@ -97,8 +97,10 @@ class MacroService:
         if cache_file.exists():
             try:
                 series = pickle.load(open(cache_file, "rb"))
-                logger.info(f"Loaded {name} from cache")
-                return series
+                if isinstance(series, pd.Series):
+                    logger.info(f"Loaded {name} from cache")
+                    return series
+                logger.warning(f"Cached macro data for {name} is invalid, redownloading")
             except Exception as e:
                 logger.warning(f"Cache read failed for {name}: {e}")
 
@@ -113,7 +115,30 @@ class MacroService:
                 logger.warning(f"No data for {symbol}")
                 return None
 
-            series = df["Adj Close"]
+            if isinstance(df.columns, pd.MultiIndex):
+                if ("Adj Close", symbol) in df.columns:
+                    series = df[("Adj Close", symbol)]
+                elif ("Close", symbol) in df.columns:
+                    series = df[("Close", symbol)]
+                elif "Adj Close" in df.columns.get_level_values(0):
+                    col = [c for c in df.columns if c[0] == "Adj Close"][0]
+                    series = df[col]
+                elif "Close" in df.columns.get_level_values(0):
+                    col = [c for c in df.columns if c[0] == "Close"][0]
+                    series = df[col]
+                else:
+                    logger.warning(f"Macro symbol {symbol} missing Close/Adj Close columns")
+                    return None
+            else:
+                if "Adj Close" in df.columns:
+                    series = df["Adj Close"]
+                elif "Close" in df.columns:
+                    series = df["Close"]
+                else:
+                    logger.warning(f"Macro symbol {symbol} missing Close/Adj Close columns")
+                    return None
+
+            series = pd.Series(series).copy()
             series.name = name
             series.to_pickle(cache_file)
             logger.info(f"Downloaded and cached {name}")
@@ -158,12 +183,19 @@ class MacroService:
             if oil is not None:
                 macro_data["oil"] = oil
 
-        if not macro_data:
+        # Keep only valid series values
+        valid_macro_data = {
+            name: series
+            for name, series in macro_data.items()
+            if isinstance(series, pd.Series)
+        }
+
+        if not valid_macro_data:
             logger.warning("No macro data loaded!")
             return pd.DataFrame()
 
         # Combine into DataFrame
-        macro_df = pd.DataFrame(macro_data)
+        macro_df = pd.concat(valid_macro_data, axis=1, keys=valid_macro_data.keys())
         macro_df.index.name = "date"
         macro_df = macro_df.sort_index()
 
@@ -239,6 +271,10 @@ class MacroService:
             self._macro_df = self.load_all_macro()
             self._macro_df = self.compute_macro_features(self._macro_df)
 
+        if self._macro_df.empty:
+            logger.warning("Macro snapshot requested but no macro data is available")
+            return {}
+
         date_str = pd.Timestamp(date).normalize()
         if date_str not in self._macro_df.index:
             logger.warning(f"No macro data for {date_str}, using nearest")
@@ -285,6 +321,11 @@ class MacroService:
         if self._macro_df is None:
             self._macro_df = self.load_all_macro()
             self._macro_df = self.compute_macro_features(self._macro_df)
+
+        if self._macro_df.empty:
+            # Return an empty DataFrame with requested index if no macro data exists
+            dates = pd.to_datetime(dates)
+            return pd.DataFrame(index=dates)
 
         # Convert dates to timestamps
         dates = pd.to_datetime(dates)

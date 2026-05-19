@@ -37,6 +37,7 @@ class RankingService:
     def __init__(
         self,
         universe: str = "sp500_tech",
+        tickers: Optional[List[str]] = None,
         model_name: Optional[str] = None,
         checkpoint_dir: str = "checkpoints",
     ):
@@ -44,11 +45,13 @@ class RankingService:
         Initialize ranking service.
         
         Args:
-            universe: Stock universe ("sp500_tech", "nasdaq_100", "nifty_50")
+            universe: Stock universe ("sp500_tech", "nasdaq_100", "nifty_50", presets, or custom lists)
+            tickers: Explicit custom ticker list (overrides universe presets)
             model_name: Trained ranker model name (if None, uses default)
             checkpoint_dir: Path to model checkpoints
         """
         self.universe = universe
+        self.tickers = tickers
         self.checkpoint_dir = checkpoint_dir
         self.registry = get_registry(checkpoint_dir)
         
@@ -57,20 +60,20 @@ class RankingService:
             model_name = get_default_model(mode="market", checkpoint_dir=checkpoint_dir)
         
         if model_name is None:
-            logger.warning("No trained market model found. Analysis will use zero scores.")
+            logger.warning("No trained market model found. Analysis will use fallback scoring.")
             self.model = None
         else:
             self.model = self.registry.load_model(model_name)
             logger.info(f"Loaded market model: {model_name}")
 
         # Initialize data services
-        self.dataset_service = MarketDataset(
-            DatasetConfig(
-                universe=universe,
-                start_date="2023-01-01",
-                cache_dir=None,
-            )
+        dataset_config = DatasetConfig(
+            universe=universe,
+            tickers=tickers,
+            start_date="2023-01-01",
+            cache_dir=None,
         )
+        self.dataset_service = MarketDataset(dataset_config)
         
         self.macro_service = MacroService(
             MacroConfig(
@@ -143,7 +146,7 @@ class RankingService:
         df = self.feature_engineer.add_macro_interactions(df, macro_df)
         
         # Drop NaN rows
-        df = self.feature_engineer.drop_nan_rows(df)
+        df = self.feature_engineer.drop_nan_rows(df, require_target=False)
         
         logger.info(f"Features generated. Shape: {df.shape}")
         
@@ -165,9 +168,13 @@ class RankingService:
             DataFrame: date | ticker | rank (or score)
         """
         if self.model is None:
-            logger.warning("No model available. Returning zero scores.")
+            logger.warning("No model available. Returning fallback scores from target_rank.")
             df_result = df[["date", "ticker"]].copy()
-            df_result["rank"] = 1
+            if "target_rank" in df.columns:
+                df_result["score"] = df["target_rank"].fillna(0)
+            else:
+                df_result["score"] = 0
+            df_result["rank"] = df_result.groupby("date")["score"].rank(ascending=False, method="first")
             return df_result
 
         feature_cols = self.feature_engineer.get_feature_list(include_target=False)
@@ -222,10 +229,14 @@ class RankingService:
                 )
                 date_df = ranked[ranked["date"] == date]
         
-        longs = date_df.nsmallest(top_n, "rank")["ticker"].tolist()
-        shorts = date_df.nlargest(bottom_n, "rank")["ticker"].tolist()
-        
-        return {"long": longs, "short": shorts}
+        long_df = date_df.sort_values(["rank", "score"], ascending=[True, False]).head(top_n)
+        long_tickers = long_df["ticker"].tolist()
+
+        short_df = date_df[~date_df["ticker"].isin(long_tickers)]
+        short_df = short_df.sort_values(["rank", "score"], ascending=[False, True]).head(bottom_n)
+        short_tickers = short_df["ticker"].tolist()
+
+        return {"long": long_tickers, "short": short_tickers}
 
     def get_macro_context(self, date: Optional[datetime] = None) -> Dict[str, Any]:
         """

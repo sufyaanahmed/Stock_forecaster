@@ -6,7 +6,7 @@
 ```
 Connection to 127.0.0.1 (localhost) on port 8000 was refused.
 Why? No server is listening on port 8000.
-Where? FastAPI backend should be running there.
+Where? FastAPI backend should be running there. 
 ```
 
 ### Why It Happened

@@ -77,7 +77,7 @@ export default function MarketDashboard({ universe = 'sp500_tech', onUniverseCha
     }
   }, [universe]);
 
-  useEffect(() => { loadAnalysis(); }, [loadAnalysis]);
+  useEffect(() => { loadAnalysis(); setBacktest(null); }, [loadAnalysis]);
 
   // ── Fetch backtest ────────────────────────────────────────────────────────
   const loadBacktest = useCallback(async () => {

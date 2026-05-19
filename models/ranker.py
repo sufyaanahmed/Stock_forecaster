@@ -38,10 +38,16 @@ class RankerModel:
         "learning_rate": 0.1,
         "num_threads": 4,
         "verbose": -1,
+        "label_bins": 5,
+        "label_gain": None,
     }
 
-    def __init__(self, params: Optional[Dict] = None):
-        self.params = params or self.DEFAULT_PARAMS.copy()
+    def __init__(self, params: Optional[Dict] = None, label_gain: Optional[List[int]] = None):
+        self.params = self.DEFAULT_PARAMS.copy()
+        if params:
+            self.params.update(params)
+        if label_gain is not None:
+            self.params["label_gain"] = label_gain
         self.model = None
         self.feature_names = None
         self.feature_importances = None
@@ -73,13 +79,14 @@ class RankerModel:
         
         # Extract features and targets
         X = df[feature_cols].fillna(0).values.astype(np.float32)
-        y = df[target_col].fillna(0.5).values.astype(np.float32)
+        y = df[target_col].fillna(0.0).values.astype(np.float32)
+        y = self.make_relevance_labels(y, n_bins=int(self.params.get("label_bins", 5)))
         
         # Group sizes: how many stocks per date
         group_sizes = df.groupby("date").size().values
         
-        # Keep dates for reference
-        dates = df["date"].values
+        # Keep dates for reference as datetimes
+        dates = pd.to_datetime(df["date"]).values
         
         logger.info(f"Prepared LambdaRank data:")
         logger.info(f"  X shape: {X.shape}")
@@ -174,16 +181,16 @@ class RankerModel:
         # Create LightGBM datasets
         train_data = lgb.Dataset(
             X_train,
-            label=y_train,
+            label=y_train.astype(np.int32),
             group=groups_train,
-            feature_names=feature_names,
+            feature_name=feature_names,
         )
         
         val_data = lgb.Dataset(
             X_val,
             label=y_val,
             group=groups_val,
-            feature_names=feature_names,
+            feature_name=feature_names,
             reference=train_data,
         )
         

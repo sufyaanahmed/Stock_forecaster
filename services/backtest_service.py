@@ -51,95 +51,69 @@ class BacktestEngine:
         long_n: int = 5,
         short_n: int = 5,
         rebalance_freq: str = "D",  # Daily
+        leverage: float = 1.0,
+        transaction_cost: float = 0.001,
+        slippage: float = 0.0005,
+        stop_loss_pct: float = 0.0,
+        take_profit_pct: float = 0.0,
+        holding_period: int = 1,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
     ) -> Dict:
         """
         Backtest a long/short ranking strategy.
-        
-        Args:
-            returns_df: DataFrame with date, ticker, returns
-            ranks_df: DataFrame with date, ticker, rank
-            long_n: Number of long positions
-            short_n: Number of short positions
-            rebalance_freq: "D" (daily), "W" (weekly), "M" (monthly)
-            start_date: Backtest start date
-            end_date: Backtest end date
-        
-        Returns:
-            {
-                returns: Series of strategy returns,
-                metrics: {sharpe, max_dd, win_rate, turnover, ...}
-            }
         """
-        # Merge returns and ranks
         df = returns_df.merge(ranks_df, on=["date", "ticker"], how="inner")
-        
-        # Filter date range
         if start_date:
             df = df[df["date"] >= start_date]
         if end_date:
             df = df[df["date"] <= end_date]
 
-        # Group by date
         dates = sorted(df["date"].unique())
-        
-        # Initialize portfolio
+        trade_dates = self._schedule_rebalance_dates(dates, rebalance_freq, holding_period)
+
         portfolio_returns = []
+        benchmark_returns = []
         dates_list = []
-        
         prev_holdings = {"long": [], "short": []}
-        
-        for date in dates:
+
+        for i, date in enumerate(trade_dates):
             date_df = df[df["date"] == date]
-            
-            # Get top longs and shorts
+            if date_df.empty:
+                continue
+
             ranked_today = date_df.sort_values("rank")
-            
             longs = ranked_today.head(long_n)["ticker"].tolist()
             shorts = ranked_today.tail(short_n)["ticker"].tolist()
-            
-            # Get tomorrow's returns
-            tomorrow_df = df[df["date"] > date]
-            if tomorrow_df.empty:
+
+            next_dates = [d for d in dates if d > date]
+            if not next_dates:
                 break
-            
-            next_date = tomorrow_df["date"].min()
-            next_date_df = tomorrow_df[tomorrow_df["date"] == next_date]
-            
-            # Compute strategy return
-            long_returns = next_date_df[next_date_df["ticker"].isin(longs)]["return"].mean()
-            short_returns = next_date_df[next_date_df["ticker"].isin(shorts)]["return"].mean()
-            
-            if np.isnan(long_returns):
-                long_returns = 0
-            if np.isnan(short_returns):
-                short_returns = 0
-            
-            # Portfolio return: equal weight long, equal weight short, 50/50 split
-            gross_return = 0.5 * long_returns - 0.5 * short_returns
-            
-            # Turnover cost
-            turnover = self._compute_turnover(
-                prev_holdings["long"], longs,
-                prev_holdings["short"], shorts
-            )
-            transaction_cost_loss = turnover * (self.transaction_cost + self.slippage)
-            
-            net_return = gross_return - transaction_cost_loss
-            
-            portfolio_returns.append(net_return)
+            next_date = next_dates[0]
+            next_date_df = df[df["date"] == next_date]
+
+            benchmark = next_date_df["return"].mean() if not next_date_df.empty else 0.0
+            benchmark_returns.append(float(np.nan_to_num(benchmark, 0.0)))
+
+            long_returns = self._apply_trade_constraints(next_date_df, longs, stop_loss_pct, take_profit_pct, is_short=False)
+            short_returns = self._apply_trade_constraints(next_date_df, shorts, stop_loss_pct, take_profit_pct, is_short=True)
+
+            gross_return = 0.5 * long_returns + 0.5 * short_returns
+            turnover = self._compute_turnover(prev_holdings["long"], longs, prev_holdings["short"], shorts)
+            transaction_cost_loss = turnover * (transaction_cost + slippage) * leverage
+            net_return = gross_return * leverage - transaction_cost_loss
+
+            portfolio_returns.append(float(np.nan_to_num(net_return, 0.0)))
             dates_list.append(next_date)
-            
             prev_holdings = {"long": longs, "short": shorts}
-        
-        # Compute metrics
+
         returns_series = pd.Series(portfolio_returns, index=dates_list)
-        
         metrics = self._compute_metrics(returns_series)
-        
+
         return {
-            "returns": returns_series,
+            "dates": dates_list,
+            "returns": returns_series.tolist(),
+            "benchmark": benchmark_returns,
             "metrics": metrics,
         }
 
@@ -149,48 +123,98 @@ class BacktestEngine:
         ranks_df: pd.DataFrame,
         long_n: int = 5,
         rebalance_freq: str = "D",
+        leverage: float = 1.0,
+        transaction_cost: float = 0.001,
+        slippage: float = 0.0005,
+        stop_loss_pct: float = 0.0,
+        take_profit_pct: float = 0.0,
+        holding_period: int = 1,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
     ) -> Dict:
         """Backtest long-only strategy."""
         df = returns_df.merge(ranks_df, on=["date", "ticker"], how="inner")
-        
         if start_date:
             df = df[df["date"] >= start_date]
         if end_date:
             df = df[df["date"] <= end_date]
 
         dates = sorted(df["date"].unique())
+        trade_dates = self._schedule_rebalance_dates(dates, rebalance_freq, holding_period)
+
         portfolio_returns = []
+        benchmark_returns = []
         dates_list = []
-        
-        for date in dates:
+        prev_holdings = {"long": []}
+
+        for date in trade_dates:
             date_df = df[df["date"] == date]
+            if date_df.empty:
+                continue
+
             ranked_today = date_df.sort_values("rank")
-            
             longs = ranked_today.head(long_n)["ticker"].tolist()
-            
-            tomorrow_df = df[df["date"] > date]
-            if tomorrow_df.empty:
+
+            next_dates = [d for d in dates if d > date]
+            if not next_dates:
                 break
-            
-            next_date = tomorrow_df["date"].min()
-            next_date_df = tomorrow_df[tomorrow_df["date"] == next_date]
-            
-            long_returns = next_date_df[next_date_df["ticker"].isin(longs)]["return"].mean()
-            if np.isnan(long_returns):
-                long_returns = 0
-            
-            portfolio_returns.append(long_returns)
+            next_date = next_dates[0]
+            next_date_df = df[df["date"] == next_date]
+
+            benchmark = next_date_df["return"].mean() if not next_date_df.empty else 0.0
+            benchmark_returns.append(float(np.nan_to_num(benchmark, 0.0)))
+
+            long_returns = self._apply_trade_constraints(next_date_df, longs, stop_loss_pct, take_profit_pct, is_short=False)
+            turnover = self._compute_turnover(prev_holdings.get("long", []), longs, [], [])
+            cost = turnover * (transaction_cost + slippage) * leverage
+            net_return = long_returns * leverage - cost
+
+            portfolio_returns.append(float(np.nan_to_num(net_return, 0.0)))
             dates_list.append(next_date)
-        
+            prev_holdings = {"long": longs}
+
         returns_series = pd.Series(portfolio_returns, index=dates_list)
         metrics = self._compute_metrics(returns_series)
-        
+
         return {
-            "returns": returns_series,
+            "dates": dates_list,
+            "returns": returns_series.tolist(),
+            "benchmark": benchmark_returns,
             "metrics": metrics,
         }
+
+    def _schedule_rebalance_dates(self, dates: List[datetime], frequency: str, holding_period: int) -> List[datetime]:
+        if frequency == "W":
+            return [d for i, d in enumerate(dates) if i % 5 == 0]
+        if frequency == "M":
+            return [d for d in dates if d.day == 1]
+        return dates[::holding_period]
+
+    def _apply_trade_constraints(
+        self,
+        next_date_df: pd.DataFrame,
+        tickers: List[str],
+        stop_loss_pct: float,
+        take_profit_pct: float,
+        is_short: bool = False,
+    ) -> float:
+        if not tickers:
+            return 0.0
+        position_returns = next_date_df[next_date_df["ticker"].isin(tickers)]["return"].tolist()
+        if not position_returns:
+            return 0.0
+
+        capped_returns = []
+        for rtn in position_returns:
+            trade_return = -rtn if is_short else rtn
+            if stop_loss_pct > 0:
+                trade_return = max(trade_return, -stop_loss_pct)
+            if take_profit_pct > 0:
+                trade_return = min(trade_return, take_profit_pct)
+            capped_returns.append(trade_return)
+
+        average_return = float(np.nan_to_num(np.mean(capped_returns), 0.0))
+        return average_return
 
     def _compute_turnover(
         self,
@@ -201,8 +225,6 @@ class BacktestEngine:
     ) -> float:
         """
         Compute portfolio turnover.
-        
-        Turnover = (outflows + inflows) / 2 / total_portfolio
         """
         long_exits = len(set(prev_long) - set(curr_long))
         long_entries = len(set(curr_long) - set(prev_long))
@@ -211,15 +233,12 @@ class BacktestEngine:
         short_entries = len(set(curr_short) - set(prev_short))
         
         total_changes = long_exits + long_entries + short_exits + short_entries
-        
         return total_changes / max(len(prev_long) + len(prev_short), 1) / 2
 
     def _compute_metrics(self, returns_series: pd.Series) -> Dict:
         """
         Compute performance metrics.
-        
-        Returns:
-            {sharpe, annual_return, max_drawdown, win_rate, hit_rate}
+
         """
         if len(returns_series) < 2:
             return {}
@@ -260,6 +279,7 @@ class BacktestEngine:
             "win_rate": win_rate,
             "hit_rate": hit_rate,
             "total_return": cumulative[-1] - 1 if len(cumulative) > 0 else 0,
+            "trade_count": len(returns_series),
         }
 
     def regime_filter(
