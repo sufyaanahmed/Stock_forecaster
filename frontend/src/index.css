@@ -106,6 +106,10 @@ body {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
 }
+@keyframes tooltip-slide {
+  from { opacity: 0; transform: translateX(-50%) translateY(6px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
 
 .animate-slide-up { animation: slide-up 0.4s ease both; }
 .animate-fade-in  { animation: fade-in 0.3s ease both; }

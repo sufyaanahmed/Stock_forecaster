@@ -1,26 +1,30 @@
 /**
- * api.js — QuantML Frontend API Client
- * =====================================
- * Design principles:
+ * api.js — QuantML Frontend API Client v2
+ * =========================================
+ * Dual-mode: supports both legacy LSTM and market ranker pipelines.
+ *
+ * Design:
  *   1. All URLs are RELATIVE (/api/*) — Vite proxy forwards to FastAPI.
- *      This eliminates CORS issues regardless of which port Vite picks.
  *   2. In-memory request cache with TTL to avoid hammering the backend.
  *   3. In-flight deduplication — parallel callers wait on one shared Promise.
  *   4. Automatic retry with exponential back-off for transient failures.
  *   5. Debounced ticker searches to avoid firing on every keystroke.
- *   6. Meaningful error messages surfaced to the UI.
+ *   6. Mode state is stored in memory + synced with backend.
  */
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
-const _cache = new Map();      // key → { data, expiresAt }
+const _cache   = new Map();    // key → { data, expiresAt }
 const _inflight = new Map();   // key → Promise (dedup parallel requests)
 
 const TTL = {
-  health:   15_000,   // 15s  — health changes rarely
-  models:   30_000,   // 30s  — model list changes only after training
-  analysis: 60_000,   // 1 min — analysis is expensive (full data fetch)
-  chart:   120_000,   // 2 min — chart data doesn't change intra-minute
-  status:    3_000,   // 3s   — training status must be fresh
+  health:   15_000,   // 15s
+  models:   30_000,   // 30s
+  analysis: 60_000,   // 1 min
+  chart:   120_000,   // 2 min
+  status:    3_000,   // 3s
+  market:   30_000,   // 30s — market analysis
+  backtest: 60_000,   // 1 min
+  logs:      0,       // never cache — always fresh
 };
 
 function cacheGet(key) {
@@ -41,7 +45,7 @@ export function cacheClear(keyPrefix) {
 }
 
 // ── Core fetch with retry + dedup ─────────────────────────────────────────────
-const RETRY_DELAYS = [500, 1500, 4000];   // ms between retries
+const RETRY_DELAYS = [500, 1500, 4000];
 
 async function _fetchWithRetry(url, opts = {}, retries = 2) {
   const controller = new AbortController();
@@ -63,12 +67,8 @@ async function _fetchWithRetry(url, opts = {}, retries = 2) {
     return await res.json();
   } catch (err) {
     clearTimeout(timeoutId);
-
-    // Don't retry client errors (4xx) or aborts from our own timeout
     const isClientError = err instanceof ApiError && err.status >= 400 && err.status < 500;
     if (isClientError || retries <= 0) throw err;
-
-    // Network error or 5xx → wait then retry
     const delay = RETRY_DELAYS[RETRY_DELAYS.length - retries] ?? 4000;
     console.warn(`[api] retrying ${url} in ${delay}ms (${retries} left)…`);
     await sleep(delay);
@@ -78,11 +78,9 @@ async function _fetchWithRetry(url, opts = {}, retries = 2) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-/** Fetch with cache + in-flight deduplication */
 async function cachedFetch(key, url, opts, ttl, retries = 2) {
   const cached = cacheGet(key);
   if (cached !== null) return cached;
-
   if (_inflight.has(key)) return _inflight.get(key);
 
   const promise = _fetchWithRetry(url, opts, retries)
@@ -104,12 +102,14 @@ async function cachedFetch(key, url, opts, ttl, retries = 2) {
 export class ApiError extends Error {
   constructor(message, status) {
     super(message);
-    this.name  = 'ApiError';
+    this.name   = 'ApiError';
     this.status = status;
   }
 }
 
-// ── API calls ─────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// LEGACY ENDPOINTS (single-stock LSTM)
+// ══════════════════════════════════════════════════════════════════════════════
 
 /** Check if FastAPI is reachable. Never throws — returns true/false. */
 export async function fetchHealth() {
@@ -121,72 +121,128 @@ export async function fetchHealth() {
   }
 }
 
-/** List all trained model checkpoints. */
+/** Get current active mode from backend. */
+export async function fetchMode() {
+  try {
+    return await _fetchWithRetry('/api/mode', {}, 0);
+  } catch {
+    return { mode: 'legacy' };
+  }
+}
+
+/** Switch active mode on backend. */
+export async function setMode(mode) {
+  cacheClear('health');
+  return _fetchWithRetry('/api/mode', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ mode }),
+    timeout: 10_000,
+  }, 1);
+}
+
+/** List all trained LSTM model checkpoints. */
 export async function fetchModels() {
   return cachedFetch('models', '/api/models', {}, TTL.models);
 }
 
-/**
- * Full analysis for a ticker.
- * Expensive: downloads data + runs inference. Cached for 1 min.
- */
+/** Full LSTM analysis for a ticker. */
 export async function fetchAnalysis(ticker) {
   const key = `analysis:${ticker}`;
-  return cachedFetch(
-    key,
-    `/api/analyze/${ticker}`,
-    { timeout: 120_000 },
-    TTL.analysis,
-  );
+  return cachedFetch(key, `/api/analyze/${ticker}`, { timeout: 120_000 }, TTL.analysis);
 }
 
-/**
- * OHLCV + indicator chart data.
- * Cached per ticker+period for 2 minutes.
- */
+/** OHLCV + indicator chart data. */
 export async function fetchChart(ticker, period = '1y') {
   const key = `chart:${ticker}:${period}`;
-  return cachedFetch(
-    key,
-    `/api/chart/${ticker}?period=${period}`,
-    { timeout: 60_000 },
-    TTL.chart,
-  );
+  return cachedFetch(key, `/api/chart/${ticker}?period=${period}`, { timeout: 60_000 }, TTL.chart);
 }
 
-/** Trigger background training for a ticker. Clears relevant caches. */
+/** Trigger background training for a ticker. */
 export async function triggerTrain(ticker, epochs = 100, start = '2015-01-01') {
   cacheClear(`analysis:${ticker}`);
   cacheClear('models');
-
-  const data = await _fetchWithRetry('/api/train', {
+  return _fetchWithRetry('/api/train', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ ticker, start, epochs, seq_len: 60 }),
     timeout: 15_000,
   }, 1);
-
-  return data;
 }
 
-/**
- * Poll training status. Short TTL (3s) so UI stays responsive.
- * Once status is 'done' or 'error', cache for 30s to stop hammering.
- */
+/** Poll training status. */
 export async function fetchTrainStatus(ticker) {
   const key = `status:${ticker}`;
   const data = await cachedFetch(key, `/api/train/status/${ticker}`, {}, TTL.status, 0);
-
-  // Extend cache TTL once terminal state reached
   const s = data?.status ?? '';
   if (s.startsWith('done') || s.startsWith('error')) {
-    cacheSet(key, data, TTL.models);   // cache for 30s, no more polling needed
+    cacheSet(key, data, TTL.models);
   }
-
   return data;
 }
 
-// ── Debounce utility (exported for use in components) ────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// MARKET ENDPOINTS (multi-stock ranker)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** Full market analysis — top longs/shorts + macro context. */
+export async function fetchMarketAnalysis(universe = 'sp500_tech', topN = 5, bottomN = 5) {
+  const key = `market:${universe}:${topN}:${bottomN}`;
+  return cachedFetch(
+    key,
+    `/market/analyze?universe=${universe}&top_n=${topN}&bottom_n=${bottomN}`,
+    { timeout: 120_000 },
+    TTL.market,
+  );
+}
+
+/** Train market ranking model. */
+export async function trainMarketModel(universe = 'sp500_tech', numRounds = 100) {
+  cacheClear('market:');
+  return _fetchWithRetry('/market/train', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ universe, model_name: 'market_v2', num_boost_rounds: numRounds }),
+    timeout: 300_000,  // 5 min — training can be slow
+  }, 0);
+}
+
+/**
+ * Run market backtest.
+ * Returns metrics including strategy_return, buy_hold_return, alpha, sharpe,
+ * max_drawdown, sortino, hit_rate, win_loss_ratio, equity_curve.
+ */
+export async function fetchMarketBacktest(
+  universe = 'sp500_tech',
+  strategyType = 'long_short',
+  longN = 5,
+  shortN = 5,
+) {
+  const key = `backtest:${universe}:${strategyType}:${longN}:${shortN}`;
+  return cachedFetch(
+    key,
+    '/market/backtest',
+    {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ universe, strategy_type: strategyType, long_n: longN, short_n: shortN }),
+      timeout: 180_000,
+    },
+    TTL.backtest,
+    0,
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LIVE LOGS (polling)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** Fetch log records newer than `sinceTs` (epoch-ms). */
+export async function fetchLogs(sinceTs = 0, limit = 200) {
+  return _fetchWithRetry(`/api/logs?since=${sinceTs}&limit=${limit}`, {}, 0);
+}
+
+// ── Debounce utility ──────────────────────────────────────────────────────────
 export function debounce(fn, ms = 400) {
   let timer;
   return (...args) => {

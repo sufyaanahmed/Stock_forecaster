@@ -8,19 +8,29 @@ export default defineConfig({
     port: 5173,
     strictPort: false,
     proxy: {
-      // All /api/* requests are forwarded to the FastAPI backend.
-      // This ELIMINATES all CORS problems - the browser talks to Vite,
-      // Vite proxies to FastAPI. No more port mismatches.
+      // All /api/* requests → FastAPI backend
       '/api': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
         rewrite: (path) => path,
-        timeout: 120000,           // 2 min — model inference can be slow on CPU
+        timeout: 120000,
         configure: (proxy) => {
           proxy.on('error', (err) => {
             console.warn('[proxy] FastAPI unreachable:', err.message);
           });
         },
+      },
+      // Market ranker routes
+      '/market': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+        timeout: 300000,
+      },
+      // Legacy LSTM routes
+      '/legacy': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+        timeout: 120000,
       },
     },
   },
